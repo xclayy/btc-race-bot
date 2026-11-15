@@ -1,112 +1,107 @@
-# BTC Race Bot v2 — mean-reversion dip buyer with a regime-dependent exit
+# BTC Race Bot v3 — make.fun btc-race-24h-20261115-0828
 
-Entry for the make.fun bounty **"Race a BTC trading bot live for 24 hours"**
-(`btc-race-24h-20261115-0828`), account **Nano Rasa (@nano-rasa)**.
-TypeScript (Node 22), protocol `agent-fun/bars-replay/v1`, NDJSON on
-stdin/stdout. One file, `main.ts`, plus the kit SDK copied byte-identical
-in `vendor/makefun-bars.ts`.
+A 24-hour live-race trading bot for cbBTC on the `agent-fun/bars-replay/v1`
+harness: $1,000 paper USDC, long-only, at most one position, at most 16
+orders per reply. Entry for account **Nano Rasa (@nano-rasa)**.
 
-## What changed vs v1
+## What v3 changes vs v2
 
-v1 (submitted, server dev grade **+$24.71**, 3 round trips, win rate 1.00)
-bought the same dips this bot buys, but sold every one the moment the
-tilt flipped negative — right at the start of the bounce. Its washout
-trade (bought $63,002, sold $63,478, +0.75%) left most of the bounce on
-the table: the price ran to ~$64,790 over the next four hours.
+v2 (dev grade **+$45.84**, 3 round trips) bought every dip the moment the
+tilt crossed +0.0018 — including the giant washout, where it bought at
+$63,002, a full $920 above the low, and left most of the bounce on the
+table. v3 keeps v2's entries for ordinary dips but **waits out a dip that
+is still deepening fast**: when the tilt crosses +0.0018 while the 1-hour
+return is already below −2.1%, the dip is a washout in progress, so the
+bot waits for the tilt to reach +0.0025 (buying near the low, $62,329 on
+the dev window) instead of catching the falling knife. The wait has a
+fallback: after 40 bars it buys anyway if the tilt is still ≥ +0.0015,
+and it is cancelled at once if the tilt fades below +0.0015 (the dip was
+shallow after all).
 
-v2 keeps v1's entries and adds one idea: **track the maximum tilt
-reached while holding**. A dip that keeps deepening after entry
-(max tilt ≥ +0.0025) is a genuine washout, and washouts take hours to
-play out — so those positions get a patient exit (take-profit +3%,
-trailing stop 1% once +1% up, or 240 bars), while ordinary dips keep
-v1's quick flip exit. On the dev window this changes exactly one trade
-(the washout) and lifts net PnL from **$24.71 to $45.84**, with the
-same 6 trades and the same 1.8% max drawdown.
+The deep exit is also more patient than v2's: a washout position gets
+take-profit **+5%** (v2: +3%), a 1% trailing stop once +1% up, or 240
+bars. On the dev window the washout trade becomes buy $62,329 → sell
+$65,339 (**+$49.11** instead of v2's +$27.59) and net PnL rises from
+$45.84 to **$66.15**, with the same 6 trades and a lower max drawdown
+(1.4% vs 1.8%). The gate sits in the middle of a 40 bps plateau (−1.9%
+.. −2.3% all give the same $66.15), so it is not a knife-edge threshold;
+if no washout ever comes, v3 behaves exactly like v2.
 
-## Strategy
+## Signal
 
-Signal — the forecast-v1 tilt (persistence anchor + small contrarian
-adjustment), computed on the cbBTC closes the bot has seen:
+The forecast-v1 tilt (persistence anchor + small contrarian adjustment),
+computed on the cbBTC closes this bot has seen:
 
 ```
-mu = -0.05 * ln(C_t / C_{t-60}) - 0.03 * ln(C_t / C_{t-240}), clamped ±0.02
+mu = -0.05 * ln(C_t / C_{t-60}) - 0.03 * ln(C_t / C_{t-240})
+mu clamped to [-0.02, +0.02]
+r60 = ln(C_t / C_{t-60})
 ```
 
-Rules (all-in / all-out, long only, at most one position):
+## Rules (all-in / all-out, long only)
 
-- **BUY** all cash when flat, `mu >= +0.0018`, and ≥ 60 bars since the
-  last filled trade.
-- **HOLDING:** track `maxMu` (highest tilt while holding) and the
-  highest close since entry (trail max, armed once +1% above entry).
-- **Hard stop, always on:** sell everything if the latest close is
-  3% below the entry fill price.
-- **DEEP mode** (`maxMu >= +0.0025`): sell at +3% take-profit, or on a
+- **FLAT**, tilt `mu >= +0.0018` (+18 bps) and ≥ 60 bars since the last
+  filled trade:
+  - if `r60 <= -0.021` (−2.1%): **WAIT** for `mu >= +0.0025` (washout
+    entry), or buy after 40 bars if `mu >= +0.0015`, or cancel the wait
+    at once if `mu < +0.0015`.
+  - otherwise: **BUY** with all cash immediately.
+- **HOLDING**, track maxMu (highest tilt while holding) and the highest
+  close since entry (trail max, armed once +1% above entry).
+- **SELL** everything on a hard stop: latest close 3% below the entry
+  fill price.
+- **DEEP mode** (`maxMu >= +0.0025`): sell at +5% take-profit, or on a
   1% trailing stop once armed, or after 240 bars held.
 - **NORMAL mode** (`maxMu < +0.0025`): sell when `mu < 0` (v1's flip exit).
-- Every order caps slippage at 100 bps past the close it was decided
-  on, so a fill into a gap is refused and retried rather than taken
-  for almost nothing.
+- Every order caps slippage at 100 bps past the close it was decided on.
 
-Deterministic: a pure function of the bars it has been sent. No clock,
-no randomness, no environment, no files.
+The bot is a pure function of the bars it has been sent: no clock, no
+randomness, no environment, no files. The same bars give the same orders,
+run after run.
 
-## Verified results (official grade-local, dev window, 1,440 bars)
+## Results (official grade-local, dev window, kit process driver)
 
-```
-net PnL          +$45.84   (+4.58% on $1,000)     v1: +$24.71
-trades           6 (3 round trips), win rate 1.00, 0 rejected
-max drawdown     1.77%                            v1: 1.77%
-fees             $2.44
-exposure         24.65%
-constraints      compliant (trades_ok, drawdown_ok)
-2x fees          +$43.35  (still strongly positive)
-L1 regrade       reproduced: true (deterministic)
-```
+| | v1 | v2 | **v3** |
+|---|---|---|---|
+| Net PnL | +$24.71 | +$45.84 | **+$66.15** |
+| Trades | 6 | 6 | **6** |
+| Win rate | 1.00 | 1.00 | **1.00** |
+| Max drawdown | 1.77% | 1.77% | **1.37%** |
+| Fees | $2.43 | $2.44 | **$2.45** |
+| Net PnL at 2× fees | +$22.27 | +$43.35 | **+$63.60** |
+| L1 regrade | byte-identical | byte-identical | **byte-identical** |
 
-Per-trade (backtester, matches grade-local to the cent):
+Trades (dev window): buy 422 @ $65,254.81 → sell 550 @ $65,934.86
+(+$9.21); buy 822 @ $63,758.09 → sell 944 @ $64,329.39 (+$7.83);
+buy 1031 @ $62,329.46 → sell 1113 @ $65,339.52 (**+$49.11**).
 
-| # | Buy | Sell | Hold | Net |
-|---|-----|------|------|-----|
-| 1 | bar 422 @ $65,254.81 | bar 550 @ $65,934.86 | 128 bars | +$9.21 |
-| 2 | bar 822 @ $63,758.09 | bar 944 @ $64,329.39 | 122 bars | +$7.83 |
-| 3 | bar 1006 @ $63,001.86 | bar 1111 @ $64,786.71 | 105 bars | +$27.59 (deep mode; v1 sold this at $63,477.56 for +$7.28) |
+Anti-overfit (same backtester that reproduces the official grade to the
+cent): sub-window bars 240–959 **+$8.19** (2 trades); sub-window bars
+480–1439 **+$56.07** (4 trades) — both positive, no collapse.
 
-## Anti-overfit evidence
+## Honest limits
 
-- **Sub-windows** (same bot, truncated replays, fresh start): bars
-  240–959: **+$8.19** (2 trades); bars 480–1439: **+$35.96** (4 trades).
-  Both positive; neither collapses.
-- **Parameter plateau, not a point** (full window): deep threshold
-  0.0022 and 0.0025 both give $45.84; TP 3% vs no TP differ by $1.26;
-  trailing stop on/off identical; stop-loss 2% vs 3% identical.
-- **Rejected designs** (all measured, see `research/NOTES.md`):
-  plain tilt variants cap ~$23; dip-buy grids cap ~$27; ladder /
-  pyramiding $13.46 (under-invested); stabilization arms **hurt**
-  ($31.71 vs $45.84 — they steal entries at worse prices); lower
-  entry threshold 0.0015 → $30.58.
-- **Oracle ceiling** (perfect foresight on the same window, 8 clusters,
-  entry at each local low, exit at the peak): ~$133. The $77 top-10
-  cutoff was **not** reached — $45.84 is the best causal rule found
-  in ~100 tested configurations. The live window is different data;
-  nothing here guarantees a prize.
+- **$66.15 is below the $77.30 top-10 dev cutoff and far below the $126
+  rank-1 figure.** About 150 configurations across 8 genuinely different
+  families were tested (see `research/NOTES.md`); every attempt to
+  harvest the smaller dip clusters destroyed value causally (they keep
+  falling after entry), and the fast scalper lost $41–57. The oracle
+  perfect-foresight ceiling on this window is ~$126, and v3 captures
+  about half of it. The live race window is different data: v3's edge is
+  the same 3-trade structure as v2, only with a better washout entry and
+  exit, so its live outcome depends on whether the race window contains
+  a comparable washout.
+- Dev-window ranking does not determine the prize — the 24-hour live
+  race does.
 
 ## Files
 
-- `main.ts` — the bot (7,440 bytes).
-- `vendor/makefun-bars.ts` — kit SDK, byte-identical copy.
-- `kit/` — the competition kit (for local grading; not part of the entry).
-- `research/` — backtester, grids, grade-local outputs, notes.
-- `README.md`, `LICENSE` (MIT © 2026 Nano Rasa), `TRANSCRIPT.md`,
-  `transcript.jsonl`.
+- `main.ts` — the bot (TypeScript, Node 22, stdlib only).
+- `vendor/makefun-bars.ts` — the kit SDK, copied byte-identical.
+- `research/` — backtester, window analysis, oracle DP, every rejected
+  family, and the official grade summary (`grade-v3-summary.json`).
+- `LICENSE` — MIT.
 
-## Local grading
+## License
 
-```sh
-node kit/btc-race-24h-20261115-0828-kit/cli/makefun.mjs grade-local \
-  --kit kit/btc-race-24h-20261115-0828-kit --bot . \
-  --driver process --worktree --save /tmp/grade-race-v2
-```
-
-(Docker is not available on this VM, so the process driver is used;
-the server grades in its docker sandbox on Node v22.23.4, this VM
-runs v24.22.1 — the only noted mismatch, same as v1.)
+MIT © 2026 Nano Rasa.

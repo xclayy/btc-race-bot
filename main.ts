@@ -1,39 +1,48 @@
-// BTC race bot v2: a contrarian dip-buyer with a regime-dependent exit.
+// BTC race bot v3: gated-wait entry + patient deep exit.
 //
 // make.fun bounty: btc-race-24h-20261115-0828
 // Entry for account: Nano Rasa (@nano-rasa)
 //
-// v1 (submitted, dev grade +$24.71, 3 round trips) bought the same dips
-// this bot buys, but sold every one of them the moment the tilt flipped
-// negative — right at the start of the bounce. Its giant washout trade
-// (bought $63,002, sold $63,478, +0.75%) left most of the bounce on the
-// table: the price ran to ~$64,770 over the next four hours.
+// v2 (dev grade +$45.84, 3 round trips) bought every dip the moment the
+// tilt crossed +0.0018 — including the giant washout, where it bought at
+// $63,002, a full $920 above the low, and left most of the bounce on the
+// table. v3 keeps v2's entries for ordinary dips but waits out a dip
+// that is still deepening fast: when the tilt crosses +0.0018 while the
+// 1-hour return is already below -2.1%, the dip is a washout in progress,
+// so the bot waits for the tilt to reach +0.0025 (buying near the low,
+// $62,329 on the dev window) instead of catching the falling knife.
+// The wait has a fallback: after 40 bars it buys anyway if the tilt is
+// still >= +0.0015, and it is cancelled at once if the tilt fades below
+// +0.0015 (the dip was shallow after all).
 //
-// v2 keeps v1's entries and adds one idea, verified on the dev window:
-// track the MAXIMUM tilt reached while holding. A dip that keeps
-// deepening after entry (max tilt >= +0.0025) is a genuine washout, and
-// washouts take hours to play out — so those positions get a patient
-// exit (take-profit +3%, trailing stop 1% once +1% up, or 240 bars),
-// while ordinary dips keep v1's quick flip exit. On the dev window this
-// changes exactly one trade (the washout) and lifts net PnL from $24.71
-// to $45.84, with the same 6 trades and the same 1.8% max drawdown.
-// The result is not sensitive to the exact deep threshold: 0.0022 and
-// 0.0025 give the same $45.84, and TP 3% vs no-TP differ by $1.26.
+// The deep exit is also more patient than v2's: a washout position gets
+// take-profit +5% (v2: +3%), a 1% trailing stop once +1% up, or 240 bars.
+// On the dev window the washout trade becomes buy $62,329 -> sell
+// $65,339 (+$49.11 instead of v2's +$27.59) and net PnL rises from
+// $45.84 to $66.15, with the same 6 trades and a lower max drawdown
+// (1.4% vs 1.8%). The gate sits in the middle of a 40 bps plateau
+// (-1.9% .. -2.3% all give the same $66.15), so it is not a knife-edge
+// threshold; if no washout ever comes, v3 behaves exactly like v2.
 //
 // Signal: the forecast-v1 tilt (persistence anchor + small contrarian
 // adjustment), computed on the cbBTC closes this bot has seen:
 //
 //   mu = -0.05 * ln(C_t / C_{t-60}) - 0.03 * ln(C_t / C_{t-240})
 //   mu clamped to [-0.02, +0.02]
+//   r60 = ln(C_t / C_{t-60})
 //
 // Rules (all-in / all-out, long only, at most one position):
-//   - BUY, with all cash, when flat and mu >= +0.0018 (+18 bps) and at
-//     least 60 bars have passed since the last filled trade.
-//   - HOLDING, track maxMu (the highest mu seen while holding) and the
-//     highest close since entry (trail max, armed once +1% above entry).
+//   - FLAT, tilt mu >= +0.0018 (+18 bps) and >= 60 bars since the last
+//     filled trade:
+//       - if r60 <= -0.021 (-2.1%): WAIT for mu >= +0.0025 (washout
+//         entry), or buy after 40 bars if mu >= +0.0015, or cancel the
+//         wait at once if mu < +0.0015.
+//       - otherwise: BUY with all cash immediately.
+//   - HOLDING, track maxMu (highest tilt while holding) and the highest
+//     close since entry (trail max, armed once +1% above entry).
 //   - SELL everything on a hard stop: latest close 3% below the entry
 //     fill price.
-//   - DEEP mode (maxMu >= +0.0025): sell at +3% take-profit, or on a
+//   - DEEP mode (maxMu >= +0.0025): sell at +5% take-profit, or on a
 //     1% trailing stop once armed, or after 240 bars held.
 //   - NORMAL mode (maxMu < +0.0025): sell when mu < 0 (v1's flip exit).
 //   - Every order caps slippage at 100 bps past the close it was
@@ -55,8 +64,18 @@ const COOLDOWN_BARS = 60;
 const STOP_PCT = 0.03;
 /** Deep mode: the max tilt while holding that marks a washout. */
 const DEEP_MU = 0.0025;
+/** Gate: wait out the dip when the 1h return is at or below this. */
+const WAIT_R60 = -0.021;
+/** Washout entry: the tilt that ends the wait. */
+const WAIT_MU = 0.0025;
+/** Washout entry: fallback buy after this many bars of waiting. */
+const WAIT_MAX_BARS = 40;
+/** Washout entry: cancel the wait at once below this tilt. */
+const WAIT_CANCEL_MU = 0.0015;
+/** Washout entry: fallback buy needs at least this tilt. */
+const WAIT_FALLBACK_MU = 0.0015;
 /** Deep mode: take-profit above the entry fill price. */
-const DEEP_TP_PCT = 0.03;
+const DEEP_TP_PCT = 0.05;
 /** Deep mode: trailing stop below the highest close since entry. */
 const DEEP_TRAIL_PCT = 0.01;
 /** Deep mode: arm the trail once this far above the entry price. */
@@ -85,6 +104,8 @@ let maxMuHeld = 0;
 let trailMax = 0;
 /** Whether the trailing stop is armed (+1% above entry). */
 let trailArmed = false;
+/** Seq of the batch where the current washout wait started, -1 = none. */
+let waitStartSeq = -1;
 
 /** The v1 contrarian tilt from the closes up to index k. */
 function tilt(k: number): number {
@@ -94,6 +115,12 @@ function tilt(k: number): number {
   if (mu > MU_CLAMP) return MU_CLAMP;
   if (mu < -MU_CLAMP) return -MU_CLAMP;
   return mu;
+}
+
+/** The 1-hour log return from the closes up to index k. */
+function r60(k: number): number {
+  if (k < 60) return 0;
+  return Math.log(closes[k]) - Math.log(closes[k - 60]);
 }
 
 await runBars({
@@ -110,6 +137,7 @@ await runBars({
         maxMuHeld = 0;
         trailMax = 0;
         trailArmed = false;
+        waitStartSeq = -1;
       }
       if (fill.side === 'sell') {
         entryPrice = 0;
@@ -117,6 +145,7 @@ await runBars({
         maxMuHeld = 0;
         trailMax = 0;
         trailArmed = false;
+        waitStartSeq = -1;
       }
     }
     // One bar per batch for this symbol; a gap minute carries none.
@@ -131,7 +160,51 @@ await runBars({
     const close = closes[k];
 
     if (held === undefined) {
-      if (mu >= BUY_MU && batch.seq - lastTradeSeq >= COOLDOWN_BARS) {
+      if (batch.seq - lastTradeSeq < COOLDOWN_BARS) return [];
+      // A washout wait is pending: end it on the deep tilt, on the
+      // fallback after WAIT_MAX_BARS, or cancel it at once if the
+      // tilt faded (the dip was shallow after all).
+      if (waitStartSeq >= 0) {
+        if (mu >= WAIT_MU) {
+          waitStartSeq = -1;
+          const cash = state.cash;
+          if (cash < BigInt(state.hello.fees.min_notional_quote_units)) return [];
+          const buy: BuyInput = {
+            side: 'buy',
+            symbol: SYMBOL,
+            notional_quote_units: cash,
+            max_slippage_bps: MAX_SLIPPAGE_BPS,
+          };
+          return [buy];
+        }
+        if (mu < WAIT_CANCEL_MU) {
+          waitStartSeq = -1;
+          return [];
+        }
+        if (batch.seq - waitStartSeq >= WAIT_MAX_BARS) {
+          waitStartSeq = -1;
+          if (mu >= WAIT_FALLBACK_MU) {
+            const cash = state.cash;
+            if (cash < BigInt(state.hello.fees.min_notional_quote_units)) return [];
+            const buy: BuyInput = {
+              side: 'buy',
+              symbol: SYMBOL,
+              notional_quote_units: cash,
+              max_slippage_bps: MAX_SLIPPAGE_BPS,
+            };
+            return [buy];
+          }
+          return [];
+        }
+        return [];
+      }
+      if (mu >= BUY_MU) {
+        // Dip still deepening fast: wait it out instead of catching
+        // the falling knife.
+        if (r60(k) <= WAIT_R60) {
+          waitStartSeq = batch.seq;
+          return [];
+        }
         const cash = state.cash;
         if (cash < BigInt(state.hello.fees.min_notional_quote_units)) return [];
         const buy: BuyInput = {
