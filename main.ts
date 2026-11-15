@@ -1,42 +1,44 @@
-// BTC race bot: a contrarian dip-buyer on cbBTC 1-minute bars.
+// BTC race bot v2: a contrarian dip-buyer with a regime-dependent exit.
 //
 // make.fun bounty: btc-race-24h-20261115-0828
 // Entry for account: Nano Rasa (@nano-rasa)
 //
-// Signal: the forecast-v1 tilt from the btc-cent-forecast-01 entry
-// (persistence anchor + small contrarian adjustment), computed on the
-// cbBTC closes this bot has seen:
+// v1 (submitted, dev grade +$24.71, 3 round trips) bought the same dips
+// this bot buys, but sold every one of them the moment the tilt flipped
+// negative — right at the start of the bounce. Its giant washout trade
+// (bought $63,002, sold $63,478, +0.75%) left most of the bounce on the
+// table: the price ran to ~$64,770 over the next four hours.
+//
+// v2 keeps v1's entries and adds one idea, verified on the dev window:
+// track the MAXIMUM tilt reached while holding. A dip that keeps
+// deepening after entry (max tilt >= +0.0025) is a genuine washout, and
+// washouts take hours to play out — so those positions get a patient
+// exit (take-profit +3%, trailing stop 1% once +1% up, or 240 bars),
+// while ordinary dips keep v1's quick flip exit. On the dev window this
+// changes exactly one trade (the washout) and lifts net PnL from $24.71
+// to $45.84, with the same 6 trades and the same 1.8% max drawdown.
+// The result is not sensitive to the exact deep threshold: 0.0022 and
+// 0.0025 give the same $45.84, and TP 3% vs no-TP differ by $1.26.
+//
+// Signal: the forecast-v1 tilt (persistence anchor + small contrarian
+// adjustment), computed on the cbBTC closes this bot has seen:
 //
 //   mu = -0.05 * ln(C_t / C_{t-60}) - 0.03 * ln(C_t / C_{t-240})
 //   mu clamped to [-0.02, +0.02]
 //
-// where C_t is the latest close and the returns are the 1-hour and
-// 4-hour log-returns. The weights are the forecast entry's, chosen on
-// 247 four-hour cases of Coinbase BTC-USD closes (MAE 40,779 cents vs
-// persistence 41,220, -1.07%); they are NOT re-tuned here.
-//
 // Rules (all-in / all-out, long only, at most one position):
 //   - BUY, with all cash, when flat and mu >= +0.0018 (+18 bps) and at
-//     least 60 bars have passed since the last filled trade. A mu that
-//     high means the last 1-4 hours fell hard, so the tilt says the
-//     next hours bounce: on the dev window a mu above +15 bps preceded
-//     a +210 bps mean 4-hour forward return (95% of bars positive),
-//     against a ~45 bps round-trip cost at this pool's depth.
-//   - SELL everything when holding and mu < 0 (the bounce has played
-//     out and the tilt has flipped), or when the latest close is 3%
-//     below the entry fill price (a hard stop for the one failure mode
-//     the tilt cannot see: a dip that keeps dipping while the signal
-//     stays pinned positive).
+//     least 60 bars have passed since the last filled trade.
+//   - HOLDING, track maxMu (the highest mu seen while holding) and the
+//     highest close since entry (trail max, armed once +1% above entry).
+//   - SELL everything on a hard stop: latest close 3% below the entry
+//     fill price.
+//   - DEEP mode (maxMu >= +0.0025): sell at +3% take-profit, or on a
+//     1% trailing stop once armed, or after 240 bars held.
+//   - NORMAL mode (maxMu < +0.0025): sell when mu < 0 (v1's flip exit).
 //   - Every order caps slippage at 100 bps past the close it was
 //     decided on, so a fill into a gap is refused and retried rather
 //     than taken for almost nothing.
-//
-// Local grade on the published dev window (grade-local, process
-// driver): net PnL +31.50 USDC, 6 trades (3 round trips), max
-// drawdown 1.8%, 0 rejected. Every baseline bot loses money on that
-// window (buy-and-hold -44.01, momentum -40.92, ema-cross -134.95),
-// which fell 4.00% overall; this bot makes money by sitting in cash
-// through the decline and buying only the sharp dips.
 //
 // The bot is a pure function of the bars it has been sent: no clock,
 // no randomness, no environment, no files. The same bars give the
@@ -51,6 +53,16 @@ const BUY_MU = 0.0018;
 const COOLDOWN_BARS = 60;
 /** Hard stop: 3% below the entry fill price. */
 const STOP_PCT = 0.03;
+/** Deep mode: the max tilt while holding that marks a washout. */
+const DEEP_MU = 0.0025;
+/** Deep mode: take-profit above the entry fill price. */
+const DEEP_TP_PCT = 0.03;
+/** Deep mode: trailing stop below the highest close since entry. */
+const DEEP_TRAIL_PCT = 0.01;
+/** Deep mode: arm the trail once this far above the entry price. */
+const TRAIL_ARM_PCT = 0.01;
+/** Deep mode: maximum bars to hold. */
+const DEEP_HOLD_BARS = 240;
 /** Slippage cap on every order, in bps past the deciding close. */
 const MAX_SLIPPAGE_BPS = 100;
 
@@ -65,6 +77,14 @@ const closes: number[] = [];
 let entryPrice = 0;
 /** Seq of the batch that reported the last filled trade. */
 let lastTradeSeq = -1_000_000_000;
+/** Seq of the batch that reported the entry fill of the open position. */
+let entrySeq = -1_000_000_000;
+/** Highest tilt seen while holding the open position. */
+let maxMuHeld = 0;
+/** Highest close seen since the entry fill. */
+let trailMax = 0;
+/** Whether the trailing stop is armed (+1% above entry). */
+let trailArmed = false;
 
 /** The v1 contrarian tilt from the closes up to index k. */
 function tilt(k: number): number {
@@ -79,12 +99,25 @@ function tilt(k: number): number {
 await runBars({
   onBatch(state: BarsState, batch: Batch) {
     // Fold this batch's fills in first: a buy fill sets the entry
-    // price (for the hard stop), any fill restarts the cooldown.
+    // price (for the hard stop and the trail), any fill restarts the
+    // cooldown.
     for (const fill of batch.fills) {
       if (fill.symbol !== SYMBOL || fill.status !== 'filled') continue;
       lastTradeSeq = batch.seq;
-      if (fill.side === 'buy') entryPrice = Number(fill.price);
-      if (fill.side === 'sell') entryPrice = 0;
+      if (fill.side === 'buy') {
+        entryPrice = Number(fill.price);
+        entrySeq = batch.seq;
+        maxMuHeld = 0;
+        trailMax = 0;
+        trailArmed = false;
+      }
+      if (fill.side === 'sell') {
+        entryPrice = 0;
+        entrySeq = -1_000_000_000;
+        maxMuHeld = 0;
+        trailMax = 0;
+        trailArmed = false;
+      }
     }
     // One bar per batch for this symbol; a gap minute carries none.
     const bar = batch.bars.find((b) => b.symbol === SYMBOL);
@@ -112,9 +145,13 @@ await runBars({
       return [];
     }
 
-    // Holding: exit when the tilt flips negative, or on the hard stop.
-    const stopped = entryPrice > 0 && close <= entryPrice * (1 - STOP_PCT);
-    if (mu < 0 || stopped) {
+    // Holding: track the highest tilt and the highest close since entry.
+    if (mu > maxMuHeld) maxMuHeld = mu;
+    if (close > trailMax) trailMax = close;
+    if (entryPrice > 0 && close >= entryPrice * (1 + TRAIL_ARM_PCT)) trailArmed = true;
+
+    // Hard stop, always on.
+    if (entryPrice > 0 && close <= entryPrice * (1 - STOP_PCT)) {
       const sell: SellInput = {
         side: 'sell',
         symbol: SYMBOL,
@@ -122,6 +159,33 @@ await runBars({
         max_slippage_bps: MAX_SLIPPAGE_BPS,
       };
       return [sell];
+    }
+
+    if (maxMuHeld >= DEEP_MU) {
+      // Deep mode: the washout gets a patient exit.
+      const tp = entryPrice > 0 && close >= entryPrice * (1 + DEEP_TP_PCT);
+      const trailed = trailArmed && trailMax > 0 && close <= trailMax * (1 - DEEP_TRAIL_PCT);
+      const heldTooLong = batch.seq - entrySeq >= DEEP_HOLD_BARS;
+      if (tp || trailed || heldTooLong) {
+        const sell: SellInput = {
+          side: 'sell',
+          symbol: SYMBOL,
+          qty: held.qty,
+          max_slippage_bps: MAX_SLIPPAGE_BPS,
+        };
+        return [sell];
+      }
+    } else {
+      // Normal mode: v1's flip exit — sell when the tilt turns negative.
+      if (mu < 0) {
+        const sell: SellInput = {
+          side: 'sell',
+          symbol: SYMBOL,
+          qty: held.qty,
+          max_slippage_bps: MAX_SLIPPAGE_BPS,
+        };
+        return [sell];
+      }
     }
     return [];
   },
